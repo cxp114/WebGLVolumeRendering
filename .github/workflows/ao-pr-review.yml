@@ -1,0 +1,75 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ao-pr-review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install agency-orchestrator
+        run: npm install -g agency-orchestrator
+
+      - name: Initialize AI agent roles
+        run: npx ao init
+
+      - name: Get PR diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff origin/${{ github.base_ref }}...HEAD -- . ':(exclude)*.min.js' ':(exclude)*.raw' \
+            | head -c 15000 > /tmp/pr_diff.txt
+          echo "${{ github.event.pull_request.title }}: ${{ github.event.pull_request.body }}" \
+            > /tmp/pr_description.txt
+
+      - name: Run PR review workflow
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          npx ao run workflows/pr-review.yaml \
+            --input pr_diff=@/tmp/pr_diff.txt \
+            --input pr_description=@/tmp/pr_description.txt \
+            --quiet \
+            --output /tmp/ao-output
+
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const outputDir = '/tmp/ao-output';
+            const entries = fs.readdirSync(outputDir);
+            if (entries.length === 0) {
+              core.warning('No ao-output found');
+              return;
+            }
+            const latest = entries.sort().at(-1);
+            const summaryPath = path.join(outputDir, latest, 'summary.md');
+            if (!fs.existsSync(summaryPath)) {
+              core.warning('summary.md not found');
+              return;
+            }
+
+            const review = fs.readFileSync(summaryPath, 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🤖 AI 代码审查（agency-orchestrator）\n\n${review}`,
+            });
